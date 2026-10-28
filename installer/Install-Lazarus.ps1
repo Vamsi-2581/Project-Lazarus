@@ -109,9 +109,18 @@ function Find-InSteamLibraries {
 # D:\Games\TWD\The Walking Dead Destinies.exe without crawling all of C:\
 function Find-OnDrives([int]$MaxDepth = 4) {
     $found = New-Object System.Collections.Generic.List[string]
-    $skip = @('Windows', '$Recycle.Bin', 'System Volume Information', 'ProgramData', 'Recovery')
-    $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match '^[A-Z]:\\$' -and $_.Free -ne $null }
+    # these trees are enormous and never hold a game install. the first
+    # version of this scan didn't skip them and took 5 minutes on a dev box.
+    $skip = @('Windows', '$Recycle.Bin', 'System Volume Information', 'ProgramData', 'Recovery', 'AppData',
+        'WindowsApps', 'node_modules', '.git', 'Microsoft', 'Windows Kits', 'Microsoft Visual Studio')
+    $sys = $env:SystemDrive.TrimEnd('\') + '\'
+    # other drives first: a game on a custom path is almost always on a
+    # secondary drive, and C:\ is the slowest to walk
+    $drives = @(Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match '^[A-Z]:\\$' -and $_.Free -ne $null } |
+        Sort-Object @{ Expression = { $_.Root -eq $sys } }, Root)
     foreach ($d in $drives) {
+        if ($d.Root -eq $sys -and $found.Count) { break }  # already found it elsewhere, don't bother with C:
+        Write-Step "searching $($d.Root)"
         $queue = New-Object System.Collections.Generic.Queue[object]
         $queue.Enqueue(@($d.Root, 0))
         while ($queue.Count) {

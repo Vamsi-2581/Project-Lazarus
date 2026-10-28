@@ -17,5 +17,6 @@ endif()
 
 enable_testing()
 
+add_subdirectory(third_party/minhook)
 add_subdirectory(src/core)
 add_subdirectory(tests)

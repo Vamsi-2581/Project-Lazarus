@@ -51,8 +51,21 @@ int g_hook_count = 0;
 // this stops us counting the same frame twice
 thread_local int t_depth = 0;
 
+// QPC timestamp of the most recent counted frame. the first version just
+// counted frames per 0.5s window, which at 45fps is 22 or 23 frames, so the
+// overlay flickered between 44 and 46. dividing by the real time between
+// first and last frame of the window gets rid of that.
+std::atomic<int64_t> g_last_present_qpc{0};
+
+void count_frame() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    g_frames.fetch_add(1, std::memory_order_relaxed);
+    g_last_present_qpc.store(t.QuadPart, std::memory_order_release);
+}
+
 HRESULT STDMETHODCALLTYPE hk_present(IDXGISwapChain* sc, UINT sync, UINT flags) {
-    if (t_depth == 0 && !(flags & DXGI_PRESENT_TEST)) g_frames.fetch_add(1, std::memory_order_relaxed);
+    if (t_depth == 0 && !(flags & DXGI_PRESENT_TEST)) count_frame();
     ++t_depth;
     HRESULT hr = g_orig_present(sc, sync, flags);
     --t_depth;
@@ -60,7 +73,7 @@ HRESULT STDMETHODCALLTYPE hk_present(IDXGISwapChain* sc, UINT sync, UINT flags) 
 }
 
 HRESULT STDMETHODCALLTYPE hk_present1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
-    if (t_depth == 0 && !(flags & DXGI_PRESENT_TEST)) g_frames.fetch_add(1, std::memory_order_relaxed);
+    if (t_depth == 0 && !(flags & DXGI_PRESENT_TEST)) count_frame();
     ++t_depth;
     HRESULT hr = g_orig_present1(sc, sync, flags, p);
     --t_depth;
@@ -238,12 +251,33 @@ void place_overlay(HWND ov) {
     SetWindowPos(ov, HWND_TOPMOST, x, y, W, H, SWP_NOACTIVATE | (show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
 }
 
+// consistent (frame count, time of that frame) pair. the render thread bumps
+// the count and then the time, so re-read until the count didn't move.
+struct Sample {
+    uint64_t frames;
+    int64_t qpc;
+};
+Sample sample() {
+    for (;;) {
+        uint64_t a = g_frames.load(std::memory_order_acquire);
+        int64_t t = g_last_present_qpc.load(std::memory_order_acquire);
+        if (g_frames.load(std::memory_order_acquire) == a) return {a, t};
+    }
+}
+
+// frames per second between two samples, -1 if there's nothing to measure
+double rate(const Sample& from, const Sample& to, double qpc_freq) {
+    if (to.frames <= from.frames || to.qpc <= from.qpc) return -1;
+    return (double)(to.frames - from.frames) * qpc_freq / (double)(to.qpc - from.qpc);
+}
+
 DWORD WINAPI overlay_thread(LPVOID) {
     HWND ov = nullptr;
-    uint64_t last_frames = g_frames.load();
-    ULONGLONG last_tick = GetTickCount64();
-    uint64_t log_frames = last_frames;
-    ULONGLONG log_tick = last_tick;
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    const double f = (double)freq.QuadPart;
+    Sample last = sample(), log_last = last;
+    ULONGLONG last_tick = GetTickCount64(), log_tick = last_tick;
 
     while (!g_stop.load()) {
         MSG m;
@@ -252,19 +286,20 @@ DWORD WINAPI overlay_thread(LPVOID) {
 
         ULONGLONG now = GetTickCount64();
         if (now - last_tick >= 500) {
-            uint64_t f = g_frames.load();
-            if (f != last_frames || g_fps_x10.load() >= 0)
-                g_fps_x10 = (int)((f - last_frames) * 10000 / (now - last_tick));
-            last_frames = f;
+            Sample s = sample();
+            double r = rate(last, s, f);
+            if (r >= 0) g_fps_x10 = (int)(r * 10.0 + 0.5);
+            else if (g_fps_x10.load() >= 0) g_fps_x10 = 0;  // frames stopped (alt-tabbed / hung)
+            last = s;
             last_tick = now;
         }
         if (cfg.log_interval > 0 && now - log_tick >= (ULONGLONG)cfg.log_interval * 1000) {
-            uint64_t f = g_frames.load();
-            if (f != log_frames)
-                api->log(self, LAZARUS_LOG_INFO, "average %.1f fps over the last %ds (%llu frames total)",
-                         (double)(f - log_frames) * 1000.0 / (double)(now - log_tick), cfg.log_interval,
-                         (unsigned long long)f);
-            log_frames = f;
+            Sample s = sample();
+            double r = rate(log_last, s, f);
+            if (r >= 0)
+                api->log(self, LAZARUS_LOG_INFO, "average %.1f fps over the last %ds (%llu frames total)", r,
+                         cfg.log_interval, (unsigned long long)s.frames);
+            log_last = s;
             log_tick = now;
         }
 

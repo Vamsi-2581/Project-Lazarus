@@ -163,14 +163,19 @@ function Resolve-GameDir {
 
 # ----------------------------------------------------------------- validation
 
-function Get-Fingerprint([string]$file) {
+# plain .NET instead of Get-FileHash: when Windows PowerShell is started from
+# pwsh 7 it inherits pwsh's PSModulePath and Get-FileHash just isn't there.
+# found that one the hard way on CI.
+function Get-FileHashHex([string]$file) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
         $fs = [System.IO.File]::OpenRead($file)
         try { $bytes = $sha.ComputeHash($fs) } finally { $fs.Dispose() }
     } finally { $sha.Dispose() }
-    return (-join ($bytes | ForEach-Object { $_.ToString('x2') })).Substring(0, 16)
+    return [System.BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant()
 }
+
+function Get-Fingerprint([string]$file) { (Get-FileHashHex $file).Substring(0, 16) }
 
 # returns a list of warnings; throws on anything that makes install impossible
 function Test-GameDir([string]$dir) {
@@ -242,7 +247,6 @@ function Write-Manifest([string]$dir, $m) {
     Move-Item -LiteralPath "$p.tmp" -Destination $p -Force
 }
 
-function Get-FileHashHex([string]$p) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() }
 
 function Test-IsUserFile([string]$rel) {
     foreach ($pat in $script:UserFiles) { if ($rel -like $pat) { return $true } }

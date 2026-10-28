@@ -34,7 +34,7 @@ function New-FakeSource([string]$root) {
 function Get-Snapshot([string]$root) {
     $h = @{}
     Get-ChildItem -LiteralPath $root -Recurse -File | ForEach-Object {
-        $h[$_.FullName.Substring($root.Length)] = (Get-FileHash -LiteralPath $_.FullName).Hash
+        $h[$_.FullName.Substring($root.Length)] = Get-FileHashHex $_.FullName
     }
     return $h
 }

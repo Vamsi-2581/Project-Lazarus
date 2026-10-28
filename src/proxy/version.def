@@ -1,0 +1,19 @@
+LIBRARY version
+EXPORTS
+    GetFileVersionInfoA=lzfwd_GetFileVersionInfoA @1
+    GetFileVersionInfoByHandle=lzfwd_GetFileVersionInfoByHandle @2
+    GetFileVersionInfoExA=lzfwd_GetFileVersionInfoExA @3
+    GetFileVersionInfoExW=lzfwd_GetFileVersionInfoExW @4
+    GetFileVersionInfoSizeA=lzfwd_GetFileVersionInfoSizeA @5
+    GetFileVersionInfoSizeExA=lzfwd_GetFileVersionInfoSizeExA @6
+    GetFileVersionInfoSizeExW=lzfwd_GetFileVersionInfoSizeExW @7
+    GetFileVersionInfoSizeW=lzfwd_GetFileVersionInfoSizeW @8
+    GetFileVersionInfoW=lzfwd_GetFileVersionInfoW @9
+    VerFindFileA=lzfwd_VerFindFileA @10
+    VerFindFileW=lzfwd_VerFindFileW @11
+    VerInstallFileA=lzfwd_VerInstallFileA @12
+    VerInstallFileW=lzfwd_VerInstallFileW @13
+    VerLanguageNameA=lzfwd_VerLanguageNameA @14
+    VerLanguageNameW=lzfwd_VerLanguageNameW @15
+    VerQueryValueA=lzfwd_VerQueryValueA @16
+    VerQueryValueW=lzfwd_VerQueryValueW @17

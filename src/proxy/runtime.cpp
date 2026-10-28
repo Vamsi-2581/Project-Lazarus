@@ -1,0 +1,640 @@
+// Loader runtime: everything that happens once IL2CPP is up.
+//
+// Design rule: nothing in here is allowed to take the game down. Every call
+// into mod code goes through an SEH guard, every failure is logged and turns
+// into "that mod/feature is off", and if the loader itself blows up we log it
+// and let the game run vanilla.
+
+#include "proxy/runtime.h"
+
+#include <MinHook.h>
+
+#include <cstdarg>
+#include <cstring>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "core/config.h"
+#include "core/ini.h"
+#include "core/log.h"
+#include "core/plan.h"
+#include "core/state.h"
+#include "lazarus/lazarus_api.h"
+
+#ifndef LAZARUS_VERSION
+#define LAZARUS_VERSION "dev"
+#endif
+
+namespace fs = std::filesystem;
+
+extern "C" void* lz_real_version[17];  // dllmain.cpp
+
+// the C API's opaque handle, has to live at global scope to match the header
+struct LazarusMod {
+    lz::ModManifest manifest;
+    std::string tag;  // "mod:<id>" for log lines
+    std::string dir_utf8;
+    lz::Ini config;
+    HMODULE dll = nullptr;
+    void (*shutdown)(LazarusMod*) = nullptr;
+    std::vector<void*> hooks;
+    bool active = false;
+};
+
+namespace lzrt {
+namespace {
+
+// ---------------------------------------------------------------- bootstrap
+
+HMODULE g_proxy = nullptr;
+wchar_t g_game_dir[MAX_PATH] = {};
+std::mutex g_early_mu;
+std::vector<std::string>* g_early = nullptr;  // leaked on purpose, tiny
+
+fs::path lazarus_dir() { return fs::path(g_game_dir) / L"Lazarus"; }
+
+// --------------------------------------------------------------- il2cpp api
+
+struct Il2Cpp {
+    void* (*domain_get)() = nullptr;
+    void** (*domain_get_assemblies)(void* domain, size_t* size) = nullptr;
+    void* (*assembly_get_image)(void* assembly) = nullptr;
+    const char* (*image_get_name)(void* image) = nullptr;
+    void* (*class_from_name)(void* image, const char* ns, const char* name) = nullptr;
+    void* (*class_get_method_from_name)(void* klass, const char* name, int argc) = nullptr;
+    void* (*resolve_icall)(const char* name) = nullptr;
+    const wchar_t* (*string_chars)(void* str) = nullptr;
+    int32_t (*string_length)(void* str) = nullptr;
+};
+
+HMODULE g_ga = nullptr;
+Il2Cpp g_il2cpp;
+bool g_il2cpp_ok = false;
+
+template <typename T>
+bool resolve(T& fn, const char* name) {
+    fn = reinterpret_cast<T>(GetProcAddress(g_ga, name));
+    if (!fn) LZ_ERROR("loader", "GameAssembly.dll is missing export %s", name);
+    return fn != nullptr;
+}
+
+bool resolve_il2cpp() {
+    bool ok = true;
+    ok &= resolve(g_il2cpp.domain_get, "il2cpp_domain_get");
+    ok &= resolve(g_il2cpp.domain_get_assemblies, "il2cpp_domain_get_assemblies");
+    ok &= resolve(g_il2cpp.assembly_get_image, "il2cpp_assembly_get_image");
+    ok &= resolve(g_il2cpp.image_get_name, "il2cpp_image_get_name");
+    ok &= resolve(g_il2cpp.class_from_name, "il2cpp_class_from_name");
+    ok &= resolve(g_il2cpp.class_get_method_from_name, "il2cpp_class_get_method_from_name");
+    ok &= resolve(g_il2cpp.resolve_icall, "il2cpp_resolve_icall");
+    ok &= resolve(g_il2cpp.string_chars, "il2cpp_string_chars");
+    ok &= resolve(g_il2cpp.string_length, "il2cpp_string_length");
+    return ok;
+}
+
+void* find_method_impl(const char* assembly, const char* ns, const char* klass, const char* method, int argc) {
+    if (!g_il2cpp_ok || !klass || !method) return nullptr;
+    size_t n = 0;
+    void** asms = g_il2cpp.domain_get_assemblies(g_il2cpp.domain_get(), &n);
+    for (size_t i = 0; i < n; ++i) {
+        void* img = g_il2cpp.assembly_get_image(asms[i]);
+        if (!img) continue;
+        if (assembly && *assembly) {
+            const char* iname = g_il2cpp.image_get_name(img);
+            if (!iname || _stricmp(iname, assembly) != 0) continue;
+        }
+        void* k = g_il2cpp.class_from_name(img, ns ? ns : "", klass);
+        if (!k) continue;
+        if (void* m = g_il2cpp.class_get_method_from_name(k, method, argc)) return m;
+    }
+    return nullptr;
+}
+
+// MethodInfo's first field is methodPointer in every Unity 2021.x il2cpp
+// (checked against the 2021.3 headers). if a future Unity moves it, this is
+// the one line that breaks.
+void* method_pointer_impl(void* mi) { return mi ? *reinterpret_cast<void**>(mi) : nullptr; }
+
+std::string il2cpp_to_utf8(void* str) {
+    if (!str) return {};
+    const wchar_t* w = g_il2cpp.string_chars(str);
+    int len = g_il2cpp.string_length(str);
+    if (!w || len <= 0) return {};
+    int need = WideCharToMultiByte(CP_UTF8, 0, w, len, nullptr, 0, nullptr, nullptr);
+    std::string out((size_t)need, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, len, out.data(), need, nullptr, nullptr);
+    return out;
+}
+
+// ------------------------------------------------------------------- state
+
+std::vector<std::unique_ptr<LazarusMod>> g_mods;
+LazarusMod g_loader_owner;  // owns loader-internal hooks so they share the bookkeeping
+
+struct SceneCb {
+    LazarusMod* mod;
+    LazarusSceneLoadedFn fn;
+    void* user;
+    bool dead;
+};
+std::vector<SceneCb> g_scene_cbs;
+
+std::string g_fingerprint;
+bool g_build_known = false;
+LazarusApi g_api{};
+
+// ------------------------------------------------------------- SEH guards
+// these can't have C++ objects with destructors in them (C2712), which is
+// why they're tiny and dumb
+
+using ModInitFn = int (*)(LazarusMod*, const LazarusApi*);
+
+int guarded_init(ModInitFn fn, LazarusMod* m, const LazarusApi* api, DWORD* code) {
+    __try {
+        return fn(m, api);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *code = GetExceptionCode();
+        return -1;
+    }
+}
+
+bool guarded_shutdown(void (*fn)(LazarusMod*), LazarusMod* m, DWORD* code) {
+    __try {
+        fn(m);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *code = GetExceptionCode();
+        return false;
+    }
+}
+
+bool guarded_scene_cb(LazarusSceneLoadedFn fn, void* user, const char* name, int idx, int mode, DWORD* code) {
+    __try {
+        fn(user, name, idx, mode);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *code = GetExceptionCode();
+        return false;
+    }
+}
+
+// --------------------------------------------------------------- C API impl
+
+void api_log(LazarusMod* self, LazarusLogLevel level, const char* fmt, ...) {
+    if (!fmt) return;
+    auto lvl = static_cast<lz::LogLevel>(level < 0 ? 0 : level > 4 ? 4 : level);
+    va_list ap;
+    va_start(ap, fmt);
+    lz::Logger::global().vwritef(lvl, self ? self->tag : std::string("mod:?"), fmt, ap);
+    va_end(ap);
+}
+
+int api_config_get_string(LazarusMod* self, const char* section, const char* key, char* buf, size_t len) {
+    if (!self || !section || !key) return 0;
+    auto v = self->config.get(section, key);
+    if (buf && len) {
+        const std::string& s = v ? *v : std::string();
+        size_t n = s.size() < len - 1 ? s.size() : len - 1;
+        std::memcpy(buf, s.data(), n);
+        buf[n] = 0;
+    }
+    return v ? 1 : 0;
+}
+
+int64_t api_config_get_int(LazarusMod* self, const char* section, const char* key, int64_t def) {
+    if (!self || !section || !key) return def;
+    auto v = self->config.get(section, key);
+    long long r = 0;
+    if (!v) return def;
+    if (!lz::parse_int(*v, r)) {
+        LZ_WARN(self->tag, "config.ini [%s] %s = '%s' is not a whole number, using %lld", section, key, v->c_str(),
+                (long long)def);
+        return def;
+    }
+    return r;
+}
+
+double api_config_get_float(LazarusMod* self, const char* section, const char* key, double def) {
+    if (!self || !section || !key) return def;
+    auto v = self->config.get(section, key);
+    double r = 0;
+    if (!v) return def;
+    if (!lz::parse_float(*v, r)) {
+        LZ_WARN(self->tag, "config.ini [%s] %s = '%s' is not a number, using %g", section, key, v->c_str(), def);
+        return def;
+    }
+    return r;
+}
+
+int api_config_get_bool(LazarusMod* self, const char* section, const char* key, int def) {
+    if (!self || !section || !key) return def;
+    auto v = self->config.get(section, key);
+    bool r = false;
+    if (!v) return def;
+    if (!lz::parse_bool(*v, r)) {
+        LZ_WARN(self->tag, "config.ini [%s] %s = '%s' is not true/false, using %s", section, key, v->c_str(),
+                def ? "true" : "false");
+        return def;
+    }
+    return r ? 1 : 0;
+}
+
+const char* api_mod_dir(LazarusMod* self) { return self ? self->dir_utf8.c_str() : ""; }
+
+void* api_il2cpp_export(const char* name) {
+    return (g_ga && name) ? reinterpret_cast<void*>(GetProcAddress(g_ga, name)) : nullptr;
+}
+
+void* api_resolve_icall(const char* name) {
+    if (!g_il2cpp_ok || !name) return nullptr;
+    return g_il2cpp.resolve_icall(name);
+}
+
+int api_hook_create(LazarusMod* self, void* target, void* detour, void** original) {
+    if (!self || !target || !detour) return LAZARUS_ERR_INVALID_ARG;
+    MH_STATUS s = MH_CreateHook(target, detour, original);
+    if (s == MH_OK) s = MH_EnableHook(target);
+    if (s != MH_OK) {
+        LZ_ERROR(self->tag, "hook at %p failed: %s", target, MH_StatusToString(s));
+        MH_RemoveHook(target);
+        return LAZARUS_ERR_HOOK_FAILED;
+    }
+    self->hooks.push_back(target);
+    LZ_DEBUG(self->tag, "hooked %p", target);
+    return LAZARUS_OK;
+}
+
+int api_hook_remove(LazarusMod* self, void* target) {
+    if (!self || !target) return LAZARUS_ERR_INVALID_ARG;
+    auto it = std::find(self->hooks.begin(), self->hooks.end(), target);
+    if (it == self->hooks.end()) return LAZARUS_ERR_NOT_FOUND;
+    MH_DisableHook(target);
+    MH_RemoveHook(target);
+    self->hooks.erase(it);
+    return LAZARUS_OK;
+}
+
+int api_on_scene_loaded(LazarusMod* self, LazarusSceneLoadedFn fn, void* user) {
+    if (!self || !fn) return LAZARUS_ERR_INVALID_ARG;
+    g_scene_cbs.push_back({self, fn, user, false});
+    return LAZARUS_OK;
+}
+
+void drop_mod_hooks(LazarusMod* m) {
+    for (void* t : m->hooks) {
+        MH_DisableHook(t);
+        MH_RemoveHook(t);
+    }
+    m->hooks.clear();
+    for (auto& cb : g_scene_cbs)
+        if (cb.mod == m) cb.dead = true;
+}
+
+// ------------------------------------------------------------ scene hook
+
+using SceneLoaded_t = void (*)(int32_t scene_handle, int32_t mode, const void* method);
+SceneLoaded_t g_orig_scene_loaded = nullptr;
+void* (*g_scene_get_name)(int32_t) = nullptr;
+int32_t (*g_scene_get_build_index)(int32_t) = nullptr;
+
+// UnityEngine.SceneManagement.SceneManager.Internal_SceneLoaded(Scene, LoadSceneMode).
+// Scene is a struct wrapping one int handle, so by value it's just an int32.
+void hk_scene_loaded(int32_t handle, int32_t mode, const void* method) {
+    // game's own sceneLoaded listeners first. if the game resets settings on
+    // scene load (likely, given how it ignores everything else), we want to
+    // run *after* that so our values are the ones that stick.
+    g_orig_scene_loaded(handle, mode, method);
+
+    std::string name = g_scene_get_name ? il2cpp_to_utf8(g_scene_get_name(handle)) : std::string();
+    int idx = g_scene_get_build_index ? g_scene_get_build_index(handle) : -1;
+    LZ_INFO("loader", "scene loaded: '%s' (build index %d, mode %d)", name.c_str(), idx, mode);
+
+    // index loop, a callback may register more callbacks
+    for (size_t i = 0; i < g_scene_cbs.size(); ++i) {
+        auto cb = g_scene_cbs[i];
+        if (cb.dead) continue;
+        DWORD code = 0;
+        if (!guarded_scene_cb(cb.fn, cb.user, name.c_str(), idx, mode, &code)) {
+            g_scene_cbs[i].dead = true;
+            LZ_ERROR(cb.mod->tag, "scene callback crashed (exception 0x%08lX), callback disabled", code);
+        }
+    }
+}
+
+void install_scene_hook() {
+    void* mi = find_method_impl("UnityEngine.CoreModule.dll", "UnityEngine.SceneManagement", "SceneManager",
+                                "Internal_SceneLoaded", 2);
+    void* target = method_pointer_impl(mi);
+    if (!target) {
+        LZ_WARN("loader", "SceneManager.Internal_SceneLoaded not found - on_scene_loaded events will not fire");
+        return;
+    }
+    g_scene_get_name = reinterpret_cast<void* (*)(int32_t)>(
+        g_il2cpp.resolve_icall("UnityEngine.SceneManagement.Scene::GetNameInternal"));
+    g_scene_get_build_index = reinterpret_cast<int32_t (*)(int32_t)>(
+        g_il2cpp.resolve_icall("UnityEngine.SceneManagement.Scene::GetBuildIndexInternal"));
+    // icalls get registered by the engine during startup; if they aren't
+    // there yet we just log scenes without names, no big deal
+    if (!g_scene_get_name) LZ_DEBUG("loader", "Scene::GetNameInternal icall not available yet");
+
+    if (api_hook_create(&g_loader_owner, target, reinterpret_cast<void*>(&hk_scene_loaded),
+                        reinterpret_cast<void**>(&g_orig_scene_loaded)) == LAZARUS_OK)
+        LZ_INFO("loader", "scene load hook installed at %p", target);
+}
+
+// ------------------------------------------------------------- mod loading
+
+void load_one(const lz::ModManifest& man, lz::BootGuard& guard) {
+    auto m = std::make_unique<LazarusMod>();
+    m->manifest = man;
+    m->tag = "mod:" + man.id;
+    m->dir_utf8 = man.dir.u8string();
+
+    auto cfg_path = man.dir / "config.ini";
+    std::string err;
+    if (fs::exists(cfg_path) && lz::Ini::load(cfg_path, m->config, err))
+        for (auto& e : m->config.errors()) LZ_WARN(m->tag, "config.ini line %d: %s", e.line, e.message.c_str());
+
+    auto dll_path = man.dir / fs::u8path(man.dll);
+    guard.begin("mod:" + man.id);
+
+    // ALTERED_SEARCH_PATH so a mod's own dependency DLLs next to it get found
+    m->dll = LoadLibraryExW(dll_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!m->dll) {
+        LZ_ERROR(m->tag, "could not load %s (Win32 error %lu)", man.dll.c_str(), GetLastError());
+        guard.end();
+        return;
+    }
+    auto init = reinterpret_cast<ModInitFn>(GetProcAddress(m->dll, "lazarus_mod_init"));
+    m->shutdown = reinterpret_cast<void (*)(LazarusMod*)>(GetProcAddress(m->dll, "lazarus_mod_shutdown"));
+    if (!init) {
+        LZ_ERROR(m->tag, "%s does not export lazarus_mod_init, not a Lazarus mod", man.dll.c_str());
+        FreeLibrary(m->dll);
+        guard.end();
+        return;
+    }
+
+    DWORD code = 0;
+    int rc = guarded_init(init, m.get(), &g_api, &code);
+    guard.end();
+    if (code) {
+        // state after an exception mid-init is unknowable, so we pull its
+        // hooks but leave the DLL mapped. unmapping code that might still be
+        // referenced somewhere is how you turn an error into a crash.
+        LZ_ERROR(m->tag, "crashed during init (exception 0x%08lX) - disabled for this session", code);
+        drop_mod_hooks(m.get());
+    } else if (rc != 0) {
+        LZ_ERROR(m->tag, "init returned %d - disabled for this session", rc);
+        drop_mod_hooks(m.get());
+        FreeLibrary(m->dll);
+        m->dll = nullptr;
+    } else {
+        m->active = true;
+        LZ_INFO(m->tag, "loaded %s v%s", man.name.c_str(), man.version.c_str());
+    }
+    g_mods.push_back(std::move(m));
+}
+
+std::string unity_version() {
+    // we *are* version.dll, so linking version.lib here would make us import
+    // ourselves. go through the forwarding table instead (indices match
+    // kVersionExports in dllmain.cpp).
+    using SizeW_t = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
+    using InfoW_t = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
+    using QueryW_t = BOOL(WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+    auto size_w = reinterpret_cast<SizeW_t>(lz_real_version[7]);
+    auto info_w = reinterpret_cast<InfoW_t>(lz_real_version[8]);
+    auto query_w = reinterpret_cast<QueryW_t>(lz_real_version[16]);
+
+    wchar_t path[MAX_PATH];
+    HMODULE up = GetModuleHandleW(L"UnityPlayer.dll");
+    if (!up || !GetModuleFileNameW(up, path, MAX_PATH)) return "unknown";
+    DWORD dummy = 0, size = size_w(path, &dummy);
+    if (!size) return "unknown";
+    std::vector<BYTE> buf(size);
+    VS_FIXEDFILEINFO* fi = nullptr;
+    UINT len = 0;
+    if (!info_w(path, 0, size, buf.data()) || !query_w(buf.data(), L"\\", (void**)&fi, &len) || !fi)
+        return "unknown";
+    char out[64];
+    std::snprintf(out, sizeof out, "%u.%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS),
+                  HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+    return out;
+}
+
+bool safe_mode_requested(std::string& why) {
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
+        why = "SHIFT held during startup";
+        return true;
+    }
+    wchar_t buf[8];
+    if (GetEnvironmentVariableW(L"LAZARUS_SAFE_MODE", buf, 8) && buf[0] == L'1') {
+        why = "LAZARUS_SAFE_MODE=1";
+        return true;
+    }
+    return false;
+}
+
+void start() {
+    auto root = lazarus_dir();
+    auto& log = lz::Logger::global();
+    log.open(root / "logs" / "lazarus.log");
+
+    auto cfg = lz::load_config(root / "lazarus.ini");
+    log.set_level(cfg.log_level);
+    LZ_INFO("loader", "Project Lazarus %s starting", LAZARUS_VERSION);
+    {
+        std::lock_guard<std::mutex> g(g_early_mu);
+        if (g_early)
+            for (auto& s : *g_early) LZ_DEBUG("boot", "%s", s.c_str());
+    }
+    LZ_INFO("loader", "game dir: %s", fs::path(g_game_dir).u8string().c_str());
+    LZ_INFO("loader", "Unity: %s", unity_version().c_str());
+    for (auto& w : cfg.warnings) LZ_WARN("config", "%s", w.c_str());
+
+    if (!cfg.enabled) {
+        LZ_INFO("loader", "disabled in lazarus.ini ([loader] enabled = false), doing nothing");
+        return;
+    }
+
+    wchar_t ga_path[MAX_PATH] = {};
+    GetModuleFileNameW(g_ga, ga_path, MAX_PATH);
+    g_fingerprint = lz::build_fingerprint(ga_path, root / "state" / "fingerprint.cache");
+    if (auto kb = lz::find_known_build(g_fingerprint)) {
+        g_build_known = true;
+        LZ_INFO("loader", "game build %s: %s", g_fingerprint.c_str(), kb->description);
+    } else {
+        LZ_WARN("loader", "game build %s is not one Lazarus has been tested on. Build-pinned mods will be skipped.",
+                g_fingerprint.empty() ? "<unreadable>" : g_fingerprint.c_str());
+    }
+
+    g_il2cpp_ok = resolve_il2cpp();
+    if (!g_il2cpp_ok) {
+        LZ_ERROR("loader", "IL2CPP API incomplete, not loading any mods. Game continues unmodified.");
+        return;
+    }
+    MH_STATUS mh = MH_Initialize();
+    if (mh != MH_OK && mh != MH_ERROR_ALREADY_INITIALIZED) {
+        LZ_ERROR("loader", "MinHook init failed: %s. Not loading mods.", MH_StatusToString(mh));
+        return;
+    }
+
+    g_api.struct_size = sizeof(LazarusApi);
+    g_api.api_version = LAZARUS_API_VERSION;
+    g_api.loader_version = LAZARUS_VERSION;
+    g_api.game_build = g_fingerprint.c_str();
+    g_api.game_build_known = g_build_known ? 1 : 0;
+    g_api.log = &api_log;
+    g_api.config_get_string = &api_config_get_string;
+    g_api.config_get_int = &api_config_get_int;
+    g_api.config_get_float = &api_config_get_float;
+    g_api.config_get_bool = &api_config_get_bool;
+    g_api.mod_dir = &api_mod_dir;
+    g_api.il2cpp_export = &api_il2cpp_export;
+    g_api.resolve_icall = &api_resolve_icall;
+    g_api.find_method = &find_method_impl;
+    g_api.method_pointer = &method_pointer_impl;
+    g_api.hook_create = &api_hook_create;
+    g_api.hook_remove = &api_hook_remove;
+    g_api.on_scene_loaded = &api_on_scene_loaded;
+
+    g_loader_owner.tag = "loader";
+    install_scene_hook();
+
+    lz::BootGuard guard(root / "state");
+    auto stale = guard.take_stale_lock();
+    if (!stale.empty()) {
+        if (stale.rfind("mod:", 0) == 0) {
+            auto id = stale.substr(4);
+            guard.quarantine(id, "game crashed or was killed while this mod was starting");
+            LZ_ERROR("loader", "last session died while '%s' was starting - it is now quarantined", id.c_str());
+        } else {
+            LZ_WARN("loader", "last session died during '%s'", stale.c_str());
+        }
+    }
+
+    std::string why;
+    if (!cfg.safe_mode && safe_mode_requested(why)) {
+        cfg.safe_mode = true;
+        LZ_WARN("loader", "safe mode: %s", why.c_str());
+    } else if (cfg.safe_mode) {
+        LZ_WARN("loader", "safe mode: enabled in lazarus.ini");
+    }
+
+    std::vector<std::string> warnings;
+    auto mods = lz::discover_mods(root / "mods", warnings);
+    for (auto& d : mods)
+        for (auto& w : d.warnings) LZ_WARN("mods", "%s: %s", d.folder.c_str(), w.c_str());
+
+    lz::PlanInput in;
+    in.loader_api_version = LAZARUS_API_VERSION;
+    in.build_fingerprint = g_fingerprint;
+    in.quarantined = guard.load_quarantine();
+    auto plan = lz::plan_load(mods, cfg, in);
+    for (auto& w : warnings) LZ_WARN("mods", "%s", w.c_str());
+    for (auto& w : plan.warnings) LZ_WARN("mods", "%s", w.c_str());
+    for (auto& s : plan.skipped) LZ_INFO("mods", "skipping %s: %s", s.id.c_str(), s.reason.c_str());
+    LZ_INFO("mods", "%zu mod(s) found, %zu to load", mods.size(), plan.load_order.size());
+
+    for (auto& man : plan.load_order) {
+        bool deps_ok = true;
+        for (auto& dep : man.requires_) {
+            bool up = false;
+            for (auto& m : g_mods)
+                if (m->manifest.id == dep && m->active) up = true;
+            if (!up) {
+                LZ_ERROR("mod:" + man.id, "dependency '%s' failed to load, skipping", dep.c_str());
+                deps_ok = false;
+                break;
+            }
+        }
+        if (deps_ok) load_one(man, guard);
+    }
+    size_t active = 0;
+    for (auto& m : g_mods) active += m->active ? 1 : 0;
+    LZ_INFO("loader", "startup complete: %zu mod(s) active", active);
+}
+
+int guarded_start(DWORD* code) {
+    __try {
+        start();
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *code = GetExceptionCode();
+        return -1;
+    }
+}
+
+}  // namespace
+
+void set_proxy_module(HMODULE self) {
+    g_proxy = self;
+    // the proxy sits next to the game exe, so its folder is the game folder
+    DWORD n = GetModuleFileNameW(self, g_game_dir, MAX_PATH);
+    if (n && n < MAX_PATH) {
+        wchar_t* slash = wcsrchr(g_game_dir, L'\\');
+        if (slash) *slash = 0;
+    }
+}
+
+void bootstrap_note(const char* msg) {
+    // raw Win32 only - this runs inside DllMain
+    wchar_t path[MAX_PATH + 64];
+    if (g_game_dir[0]) {
+        swprintf_s(path, L"%s\\Lazarus\\logs", g_game_dir);
+        CreateDirectoryW(path, nullptr);  // Lazarus\ itself exists if we're installed; fail silently otherwise
+        wcscat_s(path, L"\\bootstrap.log");
+        static bool truncated = false;
+        HANDLE h = CreateFileW(path, truncated ? FILE_APPEND_DATA : GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                               truncated ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        truncated = true;
+        if (h != INVALID_HANDLE_VALUE) {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            char line[512];
+            int n = _snprintf_s(line, _TRUNCATE, "%02d:%02d:%02d.%03d %s\r\n", st.wHour, st.wMinute, st.wSecond,
+                                st.wMilliseconds, msg);
+            DWORD w = 0;
+            if (n > 0) WriteFile(h, line, (DWORD)n, &w, nullptr);
+            CloseHandle(h);
+        }
+    }
+    std::lock_guard<std::mutex> g(g_early_mu);
+    if (!g_early) g_early = new std::vector<std::string>();
+    g_early->emplace_back(msg);
+}
+
+void on_il2cpp_ready(HMODULE game_assembly) {
+    static bool started = false;
+    if (started) return;  // unity only calls this once, but belt and braces
+    started = true;
+    g_ga = game_assembly;
+    DWORD code = 0;
+    if (guarded_start(&code) != 0)
+        LZ_ERROR("loader", "loader crashed during startup (exception 0x%08lX). Game continues; mods may be partly loaded.",
+                 code);
+}
+
+void on_il2cpp_shutdown() {
+    LZ_INFO("loader", "game shutting down");
+    for (auto it = g_mods.rbegin(); it != g_mods.rend(); ++it) {
+        auto& m = *it;
+        if (!m->active) continue;
+        if (m->shutdown) {
+            DWORD code = 0;
+            if (!guarded_shutdown(m->shutdown, m.get(), &code))
+                LZ_ERROR(m->tag, "crashed during shutdown (exception 0x%08lX)", code);
+        }
+        drop_mod_hooks(m.get());
+        m->active = false;
+    }
+    drop_mod_hooks(&g_loader_owner);
+    MH_Uninitialize();
+    LZ_INFO("loader", "shutdown complete");
+    lz::Logger::global().close();
+}
+
+}  // namespace lzrt

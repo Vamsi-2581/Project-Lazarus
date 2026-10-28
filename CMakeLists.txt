@@ -21,6 +21,7 @@ add_subdirectory(third_party/minhook)
 add_subdirectory(src/core)
 add_subdirectory(src/proxy)
 add_subdirectory(mods/graphics-settings)
+add_subdirectory(examples/hello-mod)
 add_subdirectory(tests)
 
 # build/dist = exactly what a player gets: version.dll + Lazarus/ + installer.

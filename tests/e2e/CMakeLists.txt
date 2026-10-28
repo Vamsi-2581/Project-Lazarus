@@ -28,3 +28,9 @@ add_custom_command(TARGET e2e_runner POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:lazarus_proxy> ${STAGE}/version.dll)
 
 add_test(NAME e2e_bootstrap COMMAND ${STAGE}/e2e_runner.exe)
+
+# the real graphics-settings mod, dropped in the way a player would install it
+add_dependencies(e2e_runner graphics_settings)
+add_custom_command(TARGET e2e_runner POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:graphics_settings> ${STAGE}/Lazarus/mods/graphics-settings/graphics_settings.dll
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PROJECT_SOURCE_DIR}/mods/graphics-settings/mod.ini ${STAGE}/Lazarus/mods/graphics-settings/mod.ini)

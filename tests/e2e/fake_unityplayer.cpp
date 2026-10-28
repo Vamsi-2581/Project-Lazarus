@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <initializer_list>
 
 #pragma comment(lib, "version.lib")
 
@@ -48,12 +49,16 @@ extern "C" __declspec(dllexport) int fake_unity_main(const wchar_t* report_path)
     std::fprintf(r, "init_rc=%d\nreal_init_called=%d\n", rc, state("init"));
     std::fflush(r);
 
+    auto meddle = reinterpret_cast<void (*)()>(GetProcAddress(ga, "fake_game_meddle"));
     std::fprintf(r, "value_before_scene=%d\n", get_value());
     load_scene(1, 0);  // MainMenu, single
+    meddle();          // game resets fps/vsync behind everyone's back
     load_scene(2, 1);  // Prison, additive
+    load_scene(1, 0);  // back to MainMenu, single
     std::fprintf(r, "scene_listener_calls=%d\n", state("scene_listener"));
     std::fprintf(r, "value_in_game=%d\n", get_value());
-    std::fprintf(r, "target_frame_rate=%d\n", state("target_frame_rate"));
+    for (const char* k : {"target_frame_rate", "vsync", "quality", "lod_x100", "aniso", "res_w", "res_h", "res_mode", "res_hz"})
+        std::fprintf(r, "%s=%d\n", k, state(k));
     std::fflush(r);
 
     shutdown();

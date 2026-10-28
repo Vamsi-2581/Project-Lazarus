@@ -69,6 +69,72 @@ void* icall_GetNameInternal(int32_t handle) {
 }
 int32_t icall_GetBuildIndexInternal(int32_t handle) { return handle; }
 void icall_set_targetFrameRate(int32_t v) { g_target_frame_rate = v; }
+int32_t icall_get_targetFrameRate() { return g_target_frame_rate; }
+
+// graphics engine state, roughly what a fresh Unity player boots with
+volatile int g_vsync = 1, g_quality = 1, g_aniso = 1;
+volatile float g_lod = 1.0f;
+volatile int g_res_w = 1920, g_res_h = 1080, g_res_mode = 1, g_res_hz = 0;
+
+void icall_set_vsync(int32_t v) { g_vsync = v; }
+int32_t icall_get_vsync() { return g_vsync; }
+void icall_set_quality(int32_t q, bool) {
+    // real unity applies the preset's own values when switching level,
+    // which is exactly the trap the mod has to handle
+    g_quality = q;
+    g_vsync = 1;
+    g_lod = 1.0f;
+}
+int32_t icall_get_quality() { return g_quality; }
+void icall_set_lod(float v) { g_lod = v; }
+float icall_get_lod() { return g_lod; }
+void icall_set_aniso(int32_t v) { g_aniso = v; }
+int32_t icall_get_aniso() { return g_aniso; }
+void icall_set_resolution(int32_t w, int32_t h, int32_t mode, int32_t hz) {
+    g_res_w = w;
+    g_res_h = h;
+    g_res_mode = mode;
+    g_res_hz = hz;
+}
+int32_t icall_screen_w() { return g_res_w; }
+int32_t icall_screen_h() { return g_res_h; }
+int32_t icall_get_mode() { return g_res_mode; }
+
+// fake System.String[] with the real Il2CppArray layout: header, bounds,
+// max_length, then elements at +32
+FakeString g_q_low{L"Low"}, g_q_med{L"Medium"}, g_q_high{L"High"};
+struct {
+    void* klass;
+    void* monitor;
+    void* bounds;
+    size_t max_length;
+    void* items[3];
+} g_quality_names = {nullptr, nullptr, nullptr, 3, {&g_q_low, &g_q_med, &g_q_high}};
+void* icall_get_names() { return &g_quality_names; }
+
+struct IcallEntry {
+    const char* name;
+    void* fn;
+};
+const IcallEntry g_icalls[] = {
+    {"UnityEngine.SceneManagement.Scene::GetNameInternal", (void*)&icall_GetNameInternal},
+    {"UnityEngine.SceneManagement.Scene::GetBuildIndexInternal", (void*)&icall_GetBuildIndexInternal},
+    {"UnityEngine.Application::set_targetFrameRate", (void*)&icall_set_targetFrameRate},
+    {"UnityEngine.Application::get_targetFrameRate", (void*)&icall_get_targetFrameRate},
+    {"UnityEngine.QualitySettings::set_vSyncCount", (void*)&icall_set_vsync},
+    {"UnityEngine.QualitySettings::get_vSyncCount", (void*)&icall_get_vsync},
+    {"UnityEngine.QualitySettings::SetQualityLevel", (void*)&icall_set_quality},
+    {"UnityEngine.QualitySettings::GetQualityLevel", (void*)&icall_get_quality},
+    {"UnityEngine.QualitySettings::get_names", (void*)&icall_get_names},
+    {"UnityEngine.QualitySettings::set_lodBias", (void*)&icall_set_lod},
+    {"UnityEngine.QualitySettings::get_lodBias", (void*)&icall_get_lod},
+    {"UnityEngine.QualitySettings::set_anisotropicFiltering", (void*)&icall_set_aniso},
+    {"UnityEngine.QualitySettings::get_anisotropicFiltering", (void*)&icall_get_aniso},
+    {"UnityEngine.Screen::SetResolution", (void*)&icall_set_resolution},
+    {"UnityEngine.Screen::get_width", (void*)&icall_screen_w},
+    {"UnityEngine.Screen::get_height", (void*)&icall_screen_h},
+    {"UnityEngine.Screen::get_fullScreenMode", (void*)&icall_get_mode},
+};
 
 }  // namespace
 
@@ -98,11 +164,12 @@ EXPORT void* il2cpp_class_get_method_from_name(void* k, const char* name, int ar
     return nullptr;
 }
 EXPORT void* il2cpp_resolve_icall(const char* name) {
-    if (!std::strcmp(name, "UnityEngine.SceneManagement.Scene::GetNameInternal")) return (void*)&icall_GetNameInternal;
-    if (!std::strcmp(name, "UnityEngine.SceneManagement.Scene::GetBuildIndexInternal"))
-        return (void*)&icall_GetBuildIndexInternal;
-    if (!std::strcmp(name, "UnityEngine.Application::set_targetFrameRate")) return (void*)&icall_set_targetFrameRate;
+    for (auto& e : g_icalls)
+        if (!std::strcmp(name, e.name)) return e.fn;
     return nullptr;
+}
+EXPORT uint32_t il2cpp_array_length(void* arr) {
+    return (uint32_t) reinterpret_cast<size_t*>(static_cast<char*>(arr) + 24)[0];
 }
 EXPORT const wchar_t* il2cpp_string_chars(void* s) { return static_cast<FakeString*>(s)->chars; }
 EXPORT int32_t il2cpp_string_length(void* s) { return (int32_t)std::wcslen(static_cast<FakeString*>(s)->chars); }
@@ -119,10 +186,23 @@ EXPORT int fake_game_get_value() {
     auto fn = reinterpret_cast<int (*)(const void*)>(g_game_methods[0].methodPointer);
     return fn(&g_game_methods[0]);
 }
+// the game resetting things between scenes, like real games love to do
+EXPORT void fake_game_meddle() {
+    g_target_frame_rate = 30;
+    g_vsync = 1;
+}
 EXPORT int fake_state(const char* what) {
     if (!std::strcmp(what, "init")) return g_init_called;
     if (!std::strcmp(what, "shutdown")) return g_shutdown_called;
     if (!std::strcmp(what, "scene_listener")) return g_game_scene_listener_calls;
     if (!std::strcmp(what, "target_frame_rate")) return g_target_frame_rate;
+    if (!std::strcmp(what, "vsync")) return g_vsync;
+    if (!std::strcmp(what, "quality")) return g_quality;
+    if (!std::strcmp(what, "lod_x100")) return (int)(g_lod * 100.0f + 0.5f);
+    if (!std::strcmp(what, "aniso")) return g_aniso;
+    if (!std::strcmp(what, "res_w")) return g_res_w;
+    if (!std::strcmp(what, "res_h")) return g_res_h;
+    if (!std::strcmp(what, "res_mode")) return g_res_mode;
+    if (!std::strcmp(what, "res_hz")) return g_res_hz;
     return -999;
 }

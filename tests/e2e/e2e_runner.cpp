@@ -133,12 +133,13 @@ int wmain() {
                "il2cpp_init intercepted, owner=" + run.r("init_owner"));
         expect(run.r("real_init_called") == "1", "real il2cpp_init still runs");
         expect(run.r("value_before_scene") == "42", "hook active right after init");
-        expect(run.r("scene_listener_calls") == "2", "game's own scene listener still runs");
+        expect(run.r("scene_listener_calls") == "3", "game's own scene listener still runs");
         expect(run.r("value_in_game") == "42", "gameplay hook active");
         expect(run.r("target_frame_rate") == "90", "icall from mod config applied");
         expect(run.r("real_shutdown_called") == "1", "real il2cpp_shutdown still runs");
         expect(run.r("value_after_shutdown") == "1", "hooks removed at shutdown");
-        expect(run.events == "init\nscene:MainMenu:1:0\nscene:Prison:2:1\nshutdown\n", "event order: " + run.events);
+        expect(run.events == "init\nscene:MainMenu:1:0\nscene:Prison:2:1\nscene:MainMenu:1:0\nshutdown\n",
+               "event order: " + run.events);
         expect(run.bootstrap.find("intercepted il2cpp_init") != std::string::npos, "bootstrap.log written");
         expect(run.has("scene load hook installed"), "scene hook log");
         expect(run.has("[mod:test-mod] test mod init"), "mod log tag");
@@ -204,7 +205,7 @@ int wmain() {
         configure(kEnabled, "crash_in_scene");
         auto run = launch();
         expect(run.r("finished") == "1", "game finished");
-        expect(run.r("scene_listener_calls") == "2", "game listener unaffected");
+        expect(run.r("scene_listener_calls") == "3", "game listener unaffected");
         expect(run.events == "init\nscene:MainMenu:1:0\nshutdown\n", "second scene not dispatched to dead cb: " + run.events);
         expect(run.has("scene callback crashed (exception 0xC0000005)"), "AV logged");
     });
@@ -244,6 +245,53 @@ int wmain() {
         expect(run.r("value_in_game") == "42", "good mod loaded");
         expect(run.has("skipping broken: invalid mod.ini"), "broken mod reported");
         expect(run.has("'ghost' is enabled in lazarus.ini but no such mod is installed"), "missing mod reported");
+    });
+
+    scenario("graphics-settings: applies config, survives preset reset, re-applies after game meddles", [] {
+        reset(false);
+        configure("[loader]\nlog_level = debug\n[mods]\nenabled = graphics-settings\n", "normal");
+        spit(lz() / "mods" / "graphics-settings" / "config.ini",
+             "[display]\nwindow_mode = borderless\nwidth = 2560\nheight = 1440\n"
+             "[performance]\ntarget_fps = 144\nvsync = 0\n"
+             "[quality]\nquality_level = 2\nlod_bias = 1.5\nanisotropic = force\n");
+        auto run = launch();
+        expect(run.r("finished") == "1", "game finished");
+        expect(run.r("quality") == "2", "quality level " + run.r("quality"));
+        // SetQualityLevel resets vsync+lod to the preset, mod must apply its values after
+        expect(run.r("vsync") == "0", "vsync stays off after preset switch and game meddling: " + run.r("vsync"));
+        expect(run.r("lod_x100") == "150", "lod bias " + run.r("lod_x100"));
+        expect(run.r("target_frame_rate") == "144", "fps cap restored after meddling: " + run.r("target_frame_rate"));
+        expect(run.r("aniso") == "2", "aniso force");
+        expect(run.r("res_w") == "2560" && run.r("res_h") == "1440" && run.r("res_mode") == "1", "resolution");
+        expect(run.has("quality levels: 0=Low, 1=Medium, 2=High (current 1)"), "quality names logged");
+        expect(run.has("frame rate cap set to 144"), "fps read-back logged");
+        expect(run.has("frame rate cap was changed to 30 by the game, putting it back to 144"), "drift detected");
+        expect(run.has("vsync was changed to 1 by the game"), "vsync drift detected");
+        expect(run.has("display: 2560x1440 borderless"), "display logged");
+        dump_on_fail(run);
+    });
+
+    scenario("graphics-settings: empty config leaves the game alone", [] {
+        reset(false);
+        configure("[mods]\nenabled = graphics-settings\n", "normal");
+        spit(lz() / "mods" / "graphics-settings" / "config.ini", "[performance]\ntarget_fps =\n");
+        auto run = launch();
+        expect(run.r("target_frame_rate") == "30", "game's own value untouched: " + run.r("target_frame_rate"));
+        expect(run.r("quality") == "1", "quality untouched");
+        expect(run.r("res_w") == "1920", "resolution untouched");
+        expect(run.has("config.ini has nothing set"), "idle message");
+    });
+
+    scenario("graphics-settings: bad values warn, good values still apply", [] {
+        reset(false);
+        configure("[mods]\nenabled = graphics-settings\n", "normal");
+        spit(lz() / "mods" / "graphics-settings" / "config.ini",
+             "[performance]\ntarget_fps = 2\nvsync = 0\n[quality]\nquality_level = 7\n");
+        auto run = launch();
+        expect(run.r("vsync") == "0", "valid vsync applied");
+        expect(run.r("quality") == "1", "nonexistent quality level ignored");
+        expect(run.has("target_fps = '2' is out of range"), "bad fps warned");
+        expect(run.has("quality_level 7 doesn't exist (game has 3 levels)"), "bad quality warned");
     });
 
     scenario("missing lazarus.ini: defaults, nothing loaded", [] {

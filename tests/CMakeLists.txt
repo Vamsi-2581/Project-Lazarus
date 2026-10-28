@@ -12,3 +12,8 @@ add_executable(lazarus_tests
 target_link_libraries(lazarus_tests PRIVATE lazarus_core)
 add_test(NAME core_unit_tests COMMAND lazarus_tests)
 add_subdirectory(e2e)
+
+# installer tests need Pester, which ships with Windows PowerShell 5.1
+add_test(NAME installer_tests
+  COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command
+    "Invoke-Pester -Script '${CMAKE_CURRENT_SOURCE_DIR}/installer/Install-Lazarus.Tests.ps1' -EnableExit")

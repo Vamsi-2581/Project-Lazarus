@@ -22,3 +22,15 @@ add_subdirectory(src/core)
 add_subdirectory(src/proxy)
 add_subdirectory(mods/graphics-settings)
 add_subdirectory(tests)
+
+# build/dist = exactly what a player gets: version.dll + Lazarus/ + installer.
+# the graphics-settings target already drops its files in there.
+set(DIST ${CMAKE_BINARY_DIR}/dist)
+file(WRITE ${DIST}/VERSION.txt "${PROJECT_VERSION}\n")
+add_custom_target(dist ALL
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:lazarus_proxy> ${DIST}/version.dll
+  COMMAND $<TARGET_FILE:lazarus_write_default_config> ${DIST}/Lazarus/lazarus.ini
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${DIST}/Lazarus/mods
+  COMMAND ${CMAKE_COMMAND} -E copy_directory ${PROJECT_SOURCE_DIR}/installer ${DIST}
+  COMMENT "Assembling build/dist")
+add_dependencies(dist lazarus_proxy graphics_settings lazarus_write_default_config)

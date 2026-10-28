@@ -4,7 +4,7 @@ A community restoration project for **The Walking Dead: Destinies** (Steam, PC, 
 
 [![build](https://github.com/valerisn/Project-Lazarus/actions/workflows/build.yml/badge.svg)](https://github.com/valerisn/Project-Lazarus/actions/workflows/build.yml)
 
-> **Status: pre-release, not yet verified in the running game.** The loader and the first fix are built and pass 61 automated tests. Those include an end-to-end harness that boots the real loader binary inside a fake Unity process laid out like the game. Nobody has confirmed yet that it starts inside the actual game. See [Current status](#current-status).
+> **Status: pre-release, not yet verified in the running game.** The loader and the first fix are built and pass 73 automated tests (44 unit, 15 installer, 14 end-to-end scenarios). Those include an end-to-end harness that boots the real loader binary inside a fake Unity process laid out like the game. Nobody has confirmed yet that it starts inside the actual game. See [Current status](#current-status).
 
 ## Why
 

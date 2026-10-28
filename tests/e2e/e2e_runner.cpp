@@ -294,6 +294,21 @@ int wmain() {
         expect(run.has("quality_level 7 doesn't exist (game has 3 levels)"), "bad quality warned");
     });
 
+    scenario("fps-counter: hooks real DXGI Present and counts frames exactly", [] {
+        reset(false);
+        configure("[loader]\nlog_level = debug\n[mods]\nenabled = fps-counter, graphics-settings\n", "normal");
+        spit(lz() / "mods" / "graphics-settings" / "config.ini", "[performance]\ntarget_fps = 45\n");
+        auto run = launch();
+        expect(run.r("finished") == "1", "game finished");
+        expect(run.r("frames_rendered") == "60", "fake engine presented 60 frames: " + run.r("frames_rendered"));
+        expect(run.has("present hook(s)"), "hooks installed");
+        // 60 real presents; the DXGI_PRESENT_TEST call must not count
+        expect(run.has("frames presented this session: 60"), "exact frame count");
+        expect(run.has("startup complete: 2 mod(s) active"), "both mods active together");
+        expect(run.r("target_frame_rate") == "45", "graphics-settings still applied alongside it");
+        dump_on_fail(run);
+    });
+
     scenario("missing lazarus.ini: defaults, nothing loaded", [] {
         reset(false);
         configure(kEnabled, "normal");

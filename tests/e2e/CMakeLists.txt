@@ -34,3 +34,9 @@ add_dependencies(e2e_runner graphics_settings)
 add_custom_command(TARGET e2e_runner POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:graphics_settings> ${STAGE}/Lazarus/mods/graphics-settings/graphics_settings.dll
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PROJECT_SOURCE_DIR}/mods/graphics-settings/mod.ini ${STAGE}/Lazarus/mods/graphics-settings/mod.ini)
+
+add_dependencies(e2e_runner fps_counter)
+add_custom_command(TARGET e2e_runner POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:fps_counter> ${STAGE}/Lazarus/mods/fps-counter/fps_counter.dll
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PROJECT_SOURCE_DIR}/mods/fps-counter/mod.ini ${STAGE}/Lazarus/mods/fps-counter/mod.ini
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PROJECT_SOURCE_DIR}/mods/fps-counter/config.ini ${STAGE}/Lazarus/mods/fps-counter/config.ini)

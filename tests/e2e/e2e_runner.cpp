@@ -148,6 +148,14 @@ int wmain() {
         expect(run.has("is not one Lazarus has been tested on"), "unknown build warned");
         expect(run.has("startup complete: 1 mod(s) active"), "startup summary");
         expect(run.has("shutdown complete"), "shutdown log");
+
+        // regression from the first live run: some non-Unity process in the
+        // game folder (crash handler) loaded the proxy after exit and wiped
+        // bootstrap.log. this runner isn't a Unity process either.
+        HMODULE proxy = LoadLibraryW((g_stage / "version.dll").c_str());
+        expect(proxy != nullptr, "proxy loads in a non-Unity process");
+        expect(slurp(lz() / "logs" / "bootstrap.log") == run.bootstrap, "non-Unity process left bootstrap.log alone");
+        if (proxy) FreeLibrary(proxy);
         dump_on_fail(run);
     });
 

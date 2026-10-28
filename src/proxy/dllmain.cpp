@@ -95,14 +95,16 @@ FARPROC WINAPI hooked_GetProcAddress(HMODULE mod, LPCSTR name) {
 
 void attach() {
     bool fwd = forward_init();
-    lzrt::bootstrap_note(fwd ? "forwarding to system version.dll" : "FAILED to load system version.dll");
 
     HMODULE unity = GetModuleHandleW(L"UnityPlayer.dll");
     if (!unity) {
-        // not a Unity process (or a very weird one). stay a plain version.dll.
-        lzrt::bootstrap_note("UnityPlayer.dll not loaded in this process, staying inert");
+        // not the game. first live run caught something (crash handler,
+        // probably) loading us right after the game quit, and the old code
+        // logged here first - which truncated bootstrap.log and wiped the
+        // game's own boot lines. so: no file writes at all in this case.
         return;
     }
+    lzrt::bootstrap_note(fwd ? "forwarding to system version.dll" : "FAILED to load system version.dll");
     void* orig = nullptr;
     if (lzrt::patch_iat(unity, "KERNEL32.dll", "GetProcAddress", reinterpret_cast<void*>(&hooked_GetProcAddress), &orig))
         lzrt::bootstrap_note("patched UnityPlayer.dll GetProcAddress import");

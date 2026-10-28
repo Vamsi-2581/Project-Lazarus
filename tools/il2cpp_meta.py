@@ -94,7 +94,11 @@ class Metadata:
 
     def type_name(self, ti: int) -> str:
         t = self.types[ti]
-        ns, name = self.string(t[1]), self.string(t[0])
+        name = self.string(t[0])
+        declaring_type_index = t[3]
+        if declaring_type_index >= 0:
+            return f"{self.type_name(declaring_type_index)}/{name}"
+        ns = self.string(t[1])
         return f"{ns}.{name}" if ns else name
 
     def iter_types(self):

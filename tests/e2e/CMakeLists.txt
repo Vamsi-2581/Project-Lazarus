@@ -1,0 +1,30 @@
+# Builds a fake "game folder" in build/e2e_stage that mirrors the real one:
+#   fake_game.exe -> UnityPlayer.dll -> VERSION.dll (our proxy) ... GameAssembly.dll
+set(STAGE ${CMAKE_BINARY_DIR}/e2e_stage)
+set(MODDIR ${STAGE}/Lazarus/mods/test-mod)
+
+add_library(fake_gameassembly SHARED fake_gameassembly.cpp)
+set_target_properties(fake_gameassembly PROPERTIES OUTPUT_NAME GameAssembly)
+
+add_library(fake_unityplayer SHARED fake_unityplayer.cpp)
+set_target_properties(fake_unityplayer PROPERTIES OUTPUT_NAME UnityPlayer)
+
+add_executable(fake_game fake_game.cpp)
+target_link_libraries(fake_game PRIVATE fake_unityplayer)
+
+add_library(test_mod SHARED test_mod.cpp)
+target_include_directories(test_mod PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+add_executable(e2e_runner e2e_runner.cpp)
+add_dependencies(e2e_runner fake_game fake_gameassembly test_mod lazarus_proxy)
+
+foreach(t fake_gameassembly fake_unityplayer fake_game e2e_runner)
+  set_target_properties(${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY $<1:${STAGE}>)
+endforeach()
+set_target_properties(test_mod PROPERTIES RUNTIME_OUTPUT_DIRECTORY $<1:${MODDIR}>)
+
+# the real proxy gets copied in as version.dll, exactly what the installer does
+add_custom_command(TARGET e2e_runner POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:lazarus_proxy> ${STAGE}/version.dll)
+
+add_test(NAME e2e_bootstrap COMMAND ${STAGE}/e2e_runner.exe)

@@ -4,6 +4,7 @@ add_executable(lazarus_tests
   test_log.cpp
   test_manifest.cpp
   test_config.cpp
+  test_plan.cpp
 )
 target_link_libraries(lazarus_tests PRIVATE lazarus_core)
 add_test(NAME core_unit_tests COMMAND lazarus_tests)

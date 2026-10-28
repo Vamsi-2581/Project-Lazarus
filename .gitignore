@@ -1,0 +1,26 @@
+# build output
+/build/
+/out/
+/dist/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+
+# local machine stuff - never commit your game path or game files
+/local/
+*.local.ini
+lazarus.local.*
+__pycache__/
+*.pyc
+
+# game content must never land in this repo
+global-metadata.dat
+GameAssembly*
+UnityPlayer*
+*.assets
+*.resS
+*.resource

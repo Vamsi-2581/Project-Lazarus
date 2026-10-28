@@ -4,7 +4,7 @@ A community restoration project for **The Walking Dead: Destinies** (Steam, PC, 
 
 [![build](https://github.com/valerisn/Project-Lazarus/actions/workflows/build.yml/badge.svg)](https://github.com/valerisn/Project-Lazarus/actions/workflows/build.yml)
 
-> **Status: pre-release, not yet verified in the running game.** The loader and the first fix are built and pass 73 automated tests (44 unit, 15 installer, 14 end-to-end scenarios). Those include an end-to-end harness that boots the real loader binary inside a fake Unity process laid out like the game. Nobody has confirmed yet that it starts inside the actual game. See [Current status](#current-status).
+> **Status: pre-release. The loader and the graphics-settings fix have been verified in the real game** (build 12839205, first live run 2026-10-28: loader boots, scene hook fires, 45 FPS cap holds, clean shutdown). Details are in [docs/TESTING.md](docs/TESTING.md#live-results). Safe mode, uninstall on a real install, and most graphics options are still unverified in game.
 
 ## Why
 
@@ -16,10 +16,11 @@ The game is Unity 2021.3.17f1 using **IL2CPP**, so ordinary .NET mods and Harmon
 
 | component | state |
 |---|---|
-| Custom loader (`version.dll` proxy + IL2CPP runtime) | built, tested end-to-end against a fake Unity process. **Live game: unverified.** |
+| Custom loader (`version.dll` proxy + IL2CPP runtime) | **verified in game**: boots, hooks scene loads, loads mods, shuts down cleanly |
 | Mod API v1 (C ABI) | done, documented in [docs/MOD_API.md](docs/MOD_API.md) |
 | Safe mode, crash quarantine, build fingerprinting | done, tested |
-| **graphics-settings** fix: frame cap, vsync, window mode, resolution, quality level, LOD bias, anisotropic filtering | built, tested against the fake engine. **Live game: unverified.** |
+| **graphics-settings** fix: frame cap, vsync, window mode, resolution, LOD bias, anisotropic filtering | frame cap + vsync **verified in game**. Other options built and tested against the fake engine, not yet checked in game. The game has only one quality level, so `quality_level` does nothing here. |
+| **fps-counter**: on-screen FPS box and FPS in the log | **verified in game** (D3D11) |
 | Installer / uninstaller with Steam library discovery | done, tested. Discovery confirmed against a real install on a custom drive path. |
 | Mouse sensitivity fix | planned, see issues |
 | Key rebinding | planned, see issues |

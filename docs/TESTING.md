@@ -24,12 +24,36 @@ happy path (forwarding, interception, hooks, scene dispatch, icalls, clean shutd
 
 **Verified locally:** everything above, plus static checks against the shipped game files: the import tables, the absence of delay-loading, the il2cpp exports, the metadata version, the icall names, and that the installer finds and validates the real install on a custom drive path.
 
-**Not verified yet (needs a live run of the real game):**
+## Live results
 
-1. That the real `UnityPlayer.dll` resolves `il2cpp_init` through the patched IAT slot. Strong static evidence, not observed.
-2. That the `Internal_SceneLoaded` hook fires in the real engine.
-3. That Unity's icalls are registered and that graphics settings stick under HDRP.
-4. That `il2cpp_shutdown` is called on quit (if not, mods just don't get a shutdown callback).
+### Run 1: 2026-10-28, build 12839205 (`1b579b75b1486c0e`), Unity 2021.3.17f1
+
+Config: graphics-settings with `target_fps = 45`, `vsync = 0`; fps-counter with default settings; `log_level = debug`. The game was installed with `Install-Lazarus.ps1` on a custom drive path.
+
+| check | expected | observed |
+|---|---|---|
+| proxy boots, `il2cpp_init` intercepted | `intercepted il2cpp_init` | yes |
+| build recognized | known build line | `Steam build 12839205 (December 2023 release)` |
+| scene hook fires in the real engine | `scene loaded:` lines | `Startup` (mode 2), `Splashscreen`, `Initialize`, `Main Menu` |
+| icalls registered, settings applied | read-back lines | `vsync set to 0`, `frame rate cap set to 45`, no drift warnings on later scenes |
+| frame cap effective | ~45 fps | log averages 43.5 / 40.5 / 44.4 fps per 10 s window (dips during scene loads); overlay showed 46 (see below) |
+| DXGI Present hook | frames counted | D3D11 Present + Present1 hooked, 5320 frames in the session |
+| `il2cpp_shutdown` called on quit | `shutdown complete` | yes |
+| safe mode (SHIFT), uninstall | | not tested yet |
+
+Findings from this run:
+
+* The overlay showed 46 instead of 45. Cause: it counted whole frames per 0.5 s window (22 or 23 at 45 fps). Fixed by computing FPS from QPC frame timestamps.
+* After the game exited, a non-Unity process (most likely `UnityCrashHandler64.exe`) loaded the proxy and truncated `bootstrap.log`. Fixed: the proxy no longer writes any file outside a Unity process. Covered by an e2e regression check.
+* The first 10 s window averaged **368 fps**, even though the cap was applied at the first scene (`Startup`). Cause not yet known. It covers the Unity splash/startup phase. Later windows are capped.
+* The game ships a single quality level (`0=Ultra`), so `quality_level` has no effect in this game.
+* Initial scene load mode is reported as 2 (an internal value, not Single/Additive). Additive-only re-apply logic is unaffected.
+
+## Still unverified
+
+1. Safe mode via SHIFT and uninstall on the real install.
+2. Which `QualitySettings` (LOD bias, anisotropic) have a visible effect under HDRP (issue #6).
+3. Window mode and resolution changes in the real game.
 
 ## Live verification procedure
 

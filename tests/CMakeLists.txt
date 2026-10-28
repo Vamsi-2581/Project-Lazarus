@@ -1,0 +1,6 @@
+add_executable(lazarus_tests
+  test_main.cpp
+  test_ini.cpp
+)
+target_link_libraries(lazarus_tests PRIVATE lazarus_core)
+add_test(NAME core_unit_tests COMMAND lazarus_tests)

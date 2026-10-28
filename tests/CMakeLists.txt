@@ -16,4 +16,4 @@ add_subdirectory(e2e)
 # installer tests need Pester, which ships with Windows PowerShell 5.1
 add_test(NAME installer_tests
   COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command
-    "Invoke-Pester -Script '${CMAKE_CURRENT_SOURCE_DIR}/installer/Install-Lazarus.Tests.ps1' -EnableExit")
+    "Import-Module Pester -MaximumVersion 4.99; Invoke-Pester -Script '${CMAKE_CURRENT_SOURCE_DIR}/installer/Install-Lazarus.Tests.ps1' -EnableExit")

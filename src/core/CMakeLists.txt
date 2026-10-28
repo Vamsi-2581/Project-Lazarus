@@ -5,5 +5,6 @@ add_library(lazarus_core STATIC
   manifest.cpp
   config.cpp
   plan.cpp
+  state.cpp
 )
 target_include_directories(lazarus_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
